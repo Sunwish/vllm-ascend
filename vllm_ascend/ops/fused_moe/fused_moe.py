@@ -42,6 +42,12 @@ from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_expe
 from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult, setup_moe_comm_method
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 from vllm_ascend.quantization.methods.base import get_moe_num_logical_experts
+from vllm_ascend.quantization.mxfp8_rotation import (
+    MXFP8RotationConfig,
+    apply_mxfp8_block_rotation,
+    get_mxfp8_rotation_config,
+    validate_mxfp8_rotation_config,
+)
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import (
     ACL_FORMAT_FRACTAL_NZ,
@@ -92,6 +98,15 @@ def mock_false():
 
 def mock_true():
     return True
+
+
+def _get_shared_expert_mxfp8_rotation_config() -> MXFP8RotationConfig:
+    try:
+        quant_config = getattr(get_current_vllm_config(), "quant_config", None)
+        quant_description = getattr(quant_config, "quant_description", {}) or {}
+    except Exception:
+        return MXFP8RotationConfig()
+    return get_mxfp8_rotation_config(quant_description)
 
 
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
@@ -804,6 +819,34 @@ else:
                     # communication.
                     maybe_wait_event(fused_moe_evts.before_combine)
                     shared_out = self._shared_experts.down_proj((quantized_x, swiglu_out_scale))[0]
+                elif has_quantized_shared and self.quant_type == QuantType.MXFP8:
+                    original_dtype = hidden_states.dtype
+                    rotation_config = _get_shared_expert_mxfp8_rotation_config()
+                    if rotation_config.enable:
+                        quant_config = getattr(get_current_vllm_config(), "quant_config", None)
+                        quant_description = getattr(quant_config, "quant_description", {}) or {}
+                        validate_mxfp8_rotation_config(rotation_config, quant_description.get("group_size", 32))
+                    torch.npu.current_stream().wait_event(fused_moe_evts.before_routed_experts)
+                    if rotation_config.enable:
+                        hidden_states = apply_mxfp8_block_rotation(hidden_states, rotation_config)
+                    quantized_x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
+                        hidden_states, dst_type=torch.float8_e4m3fn
+                    )
+                    maybe_wait_event(fused_moe_evts.before_dispatch)
+                    hidden_states = self._shared_experts.gate_up_proj((quantized_x, pertoken_scale))[0]
+                    maybe_wait_event(fused_moe_evts.before_gmm2)
+                    hidden_states = torch_npu.npu_swiglu(hidden_states)
+                    if rotation_config.enable:
+                        hidden_states = apply_mxfp8_block_rotation(hidden_states, rotation_config)
+                    quantized_x, swiglu_out_scale = torch_npu.npu_dynamic_mx_quant(
+                        hidden_states, dst_type=torch.float8_e4m3fn
+                    )
+                    maybe_wait_event(fused_moe_evts.before_combine)
+                    shared_out = self._shared_experts.down_proj((quantized_x, swiglu_out_scale))[0]
+                    if isinstance(shared_out, tuple):
+                        shared_out = shared_out[0]
+                    if shared_out.dtype != original_dtype:
+                        shared_out = shared_out.to(original_dtype)
                 else:
                     # Ensure the shared experts wait for hidden_states to be ready.
                     torch.npu.current_stream().wait_event(fused_moe_evts.before_routed_experts)

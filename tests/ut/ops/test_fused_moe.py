@@ -15,6 +15,7 @@
 import ast
 import inspect
 import textwrap
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import TypedDict
 from unittest.mock import MagicMock, patch
@@ -34,6 +35,7 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEQuantParams,
     MoEWeights,
 )
+from vllm_ascend.quantization.mxfp8_rotation import MXFP8RotationConfig
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import AscendDeviceType, adapt_patch, vllm_version_is
 
@@ -948,3 +950,78 @@ class TestAscendFusedMoESharedExperts:
             layer._forward_shared_experts.assert_called_once()
         else:
             torch.testing.assert_close(result, fused_result.routed_out)
+
+    @patch("vllm_ascend.ops.fused_moe.fused_moe_0_23_0.shared_experts_calculation_stream")
+    @patch("vllm_ascend.ops.fused_moe.fused_moe_0_23_0.npu_stream_switch")
+    @patch("vllm_ascend.ops.fused_moe.fused_moe_0_23_0.apply_mxfp8_block_rotation")
+    @patch("vllm_ascend.ops.fused_moe.fused_moe_0_23_0._get_shared_expert_mxfp8_rotation_config")
+    @patch("vllm_ascend.ops.fused_moe.fused_moe_0_23_0.get_current_vllm_config")
+    @patch("vllm_ascend.ops.fused_moe.fused_moe_0_23_0.torch_npu")
+    def test_shared_experts_mxfp8_rotates_gate_and_down_inputs(
+        self,
+        mock_torch_npu,
+        mock_get_current_vllm_config,
+        mock_get_rotation_config,
+        mock_rotate,
+        mock_npu_stream_switch,
+        mock_shared_experts_stream,
+    ):
+        layer = AscendFusedMoE.__new__(AscendFusedMoE)
+        if not hasattr(layer, "_forward_shared_experts"):
+            pytest.skip("Current AscendFusedMoE has no _forward_shared_experts")
+
+        layer.multistream_overlap_shared_expert = False
+        layer.quant_type = QuantType.MXFP8
+        layer._shared_experts = MagicMock()
+        layer._shared_experts.gate_up_proj.weight_scale = torch.ones(1)
+        layer._shared_experts.down_proj.weight_scale = torch.ones(1)
+        layer._shared_experts.gate_up_proj.return_value = (torch.full((2, 32), 5.0), None)
+        layer._shared_experts.down_proj.return_value = (torch.full((2, 32), 7.0), None)
+
+        hidden_states = torch.randn(2, 32)
+        mock_get_current_vllm_config.return_value = MagicMock(
+            quant_config=MagicMock(
+                quant_description={
+                    "group_size": 32,
+                    "mxfp8_rotation_enable": True,
+                    "mxfp8_rotation_kind": "block_hadamard_sign",
+                    "mxfp8_rotation_block_size": 32,
+                    "mxfp8_rotation_seed": 3,
+                }
+            )
+        )
+        mock_get_rotation_config.return_value = MXFP8RotationConfig(enable=True, block_size=32, seed=3)
+        mock_rotate.side_effect = lambda tensor, config: tensor + 1
+        mock_npu_stream_switch.return_value = nullcontext()
+        mock_shared_experts_stream.return_value = MagicMock()
+
+        dynamic_quant_inputs = []
+
+        def fake_dynamic_mx_quant(tensor, dst_type):
+            dynamic_quant_inputs.append(tensor.clone())
+            return torch.full_like(tensor, 2.0), torch.ones((tensor.shape[0], 1), dtype=torch.uint8)
+
+        mock_torch_npu.npu_dynamic_mx_quant.side_effect = fake_dynamic_mx_quant
+        mock_torch_npu.npu_swiglu.side_effect = lambda tensor: tensor + 2
+        current_stream = MagicMock()
+        current_stream.wait_event = MagicMock()
+        current_stream.wait_stream = MagicMock()
+        fused_moe_evts = fused_moe_module.FusedMoEEvents(
+            before_routed_experts=MagicMock(),
+            before_dispatch=MagicMock(),
+            before_gmm2=MagicMock(),
+            before_combine=MagicMock(),
+            swiglu_limit=0.0,
+        )
+        with (
+            patch.object(fused_moe_module, "_EXTRA_CTX", SimpleNamespace(moe_comm_type=MoECommType.ALLGATHER)),
+            patch.object(fused_moe_legacy_module, "_EXTRA_CTX", SimpleNamespace(moe_comm_type=MoECommType.ALLGATHER)),
+            patch.object(fused_moe_legacy_module.torch.npu, "current_stream", return_value=current_stream),
+        ):
+            shared_out = layer._forward_shared_experts(hidden_states, fused_moe_evts)
+
+        assert len(dynamic_quant_inputs) == 2
+        torch.testing.assert_close(dynamic_quant_inputs[0], hidden_states + 1)
+        torch.testing.assert_close(dynamic_quant_inputs[1], torch.full((2, 32), 8.0))
+        assert mock_rotate.call_count == 2
+        torch.testing.assert_close(shared_out, torch.full((2, 32), 7.0))

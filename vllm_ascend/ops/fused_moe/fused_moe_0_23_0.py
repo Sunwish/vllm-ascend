@@ -36,6 +36,8 @@ from vllm_ascend.ops.fused_moe.fused_moe import (
     MoERunner,
     QuantType,
     VllmEplbAdaptor,
+    _get_shared_expert_mxfp8_rotation_config,
+    apply_mxfp8_block_rotation,
     get_ascend_config,
     get_compressed_expert_map,
     get_current_vllm_config,
@@ -56,6 +58,7 @@ from vllm_ascend.ops.fused_moe.fused_moe import (
     tensor_model_parallel_all_reduce,
     torch,
     torch_npu,
+    validate_mxfp8_rotation_config,
     wraps,
 )
 from vllm_ascend.utils import enable_sp
@@ -642,6 +645,34 @@ class AscendFusedMoE(FusedMoE):
                 # communication.
                 maybe_wait_event(fused_moe_evts.before_combine)
                 shared_out = self._shared_experts.down_proj((quantized_x, swiglu_out_scale))[0]
+            elif has_quantized_shared and self.quant_type == QuantType.MXFP8:
+                original_dtype = hidden_states.dtype
+                rotation_config = _get_shared_expert_mxfp8_rotation_config()
+                if rotation_config.enable:
+                    quant_config = getattr(get_current_vllm_config(), "quant_config", None)
+                    quant_description = getattr(quant_config, "quant_description", {}) or {}
+                    validate_mxfp8_rotation_config(rotation_config, quant_description.get("group_size", 32))
+                torch.npu.current_stream().wait_event(fused_moe_evts.before_routed_experts)
+                if rotation_config.enable:
+                    hidden_states = apply_mxfp8_block_rotation(hidden_states, rotation_config)
+                quantized_x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
+                    hidden_states, dst_type=torch.float8_e4m3fn
+                )
+                maybe_wait_event(fused_moe_evts.before_dispatch)
+                hidden_states = self._shared_experts.gate_up_proj((quantized_x, pertoken_scale))[0]
+                maybe_wait_event(fused_moe_evts.before_gmm2)
+                hidden_states = torch_npu.npu_swiglu(hidden_states)
+                if rotation_config.enable:
+                    hidden_states = apply_mxfp8_block_rotation(hidden_states, rotation_config)
+                quantized_x, swiglu_out_scale = torch_npu.npu_dynamic_mx_quant(
+                    hidden_states, dst_type=torch.float8_e4m3fn
+                )
+                maybe_wait_event(fused_moe_evts.before_combine)
+                shared_out = self._shared_experts.down_proj((quantized_x, swiglu_out_scale))[0]
+                if isinstance(shared_out, tuple):
+                    shared_out = shared_out[0]
+                if shared_out.dtype != original_dtype:
+                    shared_out = shared_out.to(original_dtype)
             else:
                 # Ensure the shared experts wait for hidden_states to be ready.
                 torch.npu.current_stream().wait_event(fused_moe_evts.before_routed_experts)
