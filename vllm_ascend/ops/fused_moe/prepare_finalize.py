@@ -64,11 +64,17 @@ def _maybe_apply_mxfp8_prepare_rotation(hidden_states: torch.Tensor, quant_type:
         return hidden_states
 
     validate_mxfp8_rotation_config(rotation_config, group_size=quant_description.get("group_size", 32))
-    logger.info_once(
-        "MXFP8 block rotation enabled for MoE prepare: kind=%s, block_size=%s, seed=%s",
+    logger.warning_once(
+        "MXFP8 block rotation enabled for MoE prepare: kind=%s, block_size=%s, seed=%s, hidden_shape=%s, "
+        "dtype=%s, contiguous=%s, stride=%s, quant_type=%s",
         rotation_config.kind,
         rotation_config.block_size,
         rotation_config.seed,
+        tuple(hidden_states.shape),
+        hidden_states.dtype,
+        hidden_states.is_contiguous(),
+        tuple(hidden_states.stride()),
+        quant_type,
     )
     return apply_mxfp8_block_rotation(hidden_states, rotation_config)
 

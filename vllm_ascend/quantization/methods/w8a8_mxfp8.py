@@ -89,9 +89,23 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
-        if isinstance(x, tuple):
+        layer_name = getattr(layer, "layer_name", layer.__class__.__name__)
+        layer_weight = getattr(layer, "weight", None)
+        layer_weight_scale = getattr(layer, "weight_scale", None)
+        is_tuple_input = isinstance(x, tuple)
+        quant_backend = getattr(self, "mxfp8_quant_backend", "npu")
+        rounding_mode = getattr(self, "mxfp8_rounding_mode", "rint")
+
+        if is_tuple_input:
             if self.rotation_config.enable:
-                raise ValueError("MXFP8 block rotation must run before activation quantization in AscendW8A8MXFP8DynamicLinearMethod")
+                logger.warning_once(
+                    "MXFP8 linear runtime received pre-quantized activation for layer=%s while rotation is enabled; "
+                    "this path expects rotation before dynamic quantization",
+                    layer_name,
+                )
+                raise ValueError(
+                    "MXFP8 block rotation must run before activation quantization in AscendW8A8MXFP8DynamicLinearMethod"
+                )
             quantized_x, pertoken_scale = x
             original_shape = quantized_x.shape
             output_dtype = torch.bfloat16
@@ -102,6 +116,23 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
                 x = x.view(-1, x.shape[-1])
             if self.rotation_config.enable:
                 x = apply_mxfp8_block_rotation(x, self.rotation_config)
+            logger.warning_once(
+                "MXFP8 linear runtime apply: layer=%s, input_shape=%s, input_dtype=%s, input_contiguous=%s, "
+                "weight_shape=%s, weight_scale_shape=%s, rotation_enable=%s, rotation_kind=%s, "
+                "rotation_block_size=%s, rotation_seed=%s, quant_backend=%s, rounding_mode=%s",
+                layer_name,
+                tuple(x.shape),
+                x.dtype,
+                x.is_contiguous(),
+                tuple(layer_weight.shape) if layer_weight is not None else None,
+                tuple(layer_weight_scale.shape) if layer_weight_scale is not None else None,
+                self.rotation_config.enable,
+                self.rotation_config.kind,
+                self.rotation_config.block_size,
+                self.rotation_config.seed,
+                quant_backend,
+                rounding_mode,
+            )
             quantized_x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn)
             output_dtype = x.dtype
 

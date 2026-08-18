@@ -119,6 +119,20 @@ def _apply_rotated_mxfp8_swiglu_quant(
     swiglu_limit: int,
     rotation_config: MXFP8RotationConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    logger.warning_once(
+        "MXFP8 MoE rotated swiglu path entered: hidden_shape=%s, hidden_dtype=%s, hidden_contiguous=%s, hidden_stride=%s, "
+        "w1_shape=%s, w1_scale_shape=%s, group_list_type=%s, rotation_kind=%s, block_size=%s, seed=%s",
+        tuple(hidden_states.shape),
+        hidden_states.dtype,
+        hidden_states.is_contiguous(),
+        tuple(hidden_states.stride()),
+        tuple(w1.shape),
+        tuple(w1_scale.shape),
+        group_list_type,
+        rotation_config.kind,
+        rotation_config.block_size,
+        rotation_config.seed,
+    )
     gmm1_kwargs = DeviceOperator.get_quant_gmm2_kwargs(
         input_dtype=input_hidden_dtype,
         act_quant_type=act_quant_type,
@@ -201,13 +215,51 @@ def quant_apply_mlp(
                 validate_mxfp8_rotation_config(rotation_config)
                 rotate_mxfp8_swiglu = True
                 use_gmm_swiglu_quant_fusion = False
-                logger.info_once(
+                logger.warning_once(
                     "MXFP8 block rotation enabled for MoE SwigLU output; "
-                    "using split GMM1/SwiGLU/rotation/quant path: kind=%s, block_size=%s, seed=%s",
+                    "using split GMM1/SwiGLU/rotation/quant path: kind=%s, block_size=%s, seed=%s, "
+                    "hidden_shape=%s, input_dtype=%s, contiguous=%s, stride=%s",
                     rotation_config.kind,
                     rotation_config.block_size,
                     rotation_config.seed,
+                    tuple(hidden_states.shape),
+                    hidden_states.dtype,
+                    hidden_states.is_contiguous(),
+                    tuple(hidden_states.stride()),
                 )
+            logger.warning_once(
+                "MXFP8 MoE branch selection: use_mxfp_quant=%s, fusion=%s, dynamic_eplb=%s, "
+                "use_gmm_swiglu_quant_fusion=%s, rotate_mxfp8_swiglu=%s, act_quant_type=%s, input_shape=%s, "
+                "input_dtype=%s, rotation_enable=%s",
+                use_mxfp_quant,
+                fusion,
+                dynamic_eplb,
+                use_gmm_swiglu_quant_fusion,
+                rotate_mxfp8_swiglu,
+                act_quant_type,
+                tuple(hidden_states.shape),
+                hidden_states.dtype,
+                rotation_config.enable,
+            )
+
+    logger.warning_once(
+        "MXFP8 MoE branch selection: use_mxfp_quant=%s, fusion=%s, dynamic_eplb=%s, use_gmm_swiglu_quant_fusion=%s, "
+        "rotate_mxfp8_swiglu=%s, act_quant_type=%s, mxfp_quant_dtype=%s, input_shape=%s, input_dtype=%s, input_contiguous=%s, "
+        "input_stride=%s, w1_offset=%s, w1_scale_bias=%s",
+        use_mxfp_quant,
+        fusion,
+        dynamic_eplb,
+        use_gmm_swiglu_quant_fusion,
+        rotate_mxfp8_swiglu,
+        act_quant_type,
+        mxfp_quant_dtype,
+        tuple(hidden_states.shape),
+        hidden_states.dtype,
+        hidden_states.is_contiguous(),
+        tuple(hidden_states.stride()),
+        w1_offset is not None,
+        w1_scale_bias is not None,
+    )
 
     if w1_offset is not None:
         unquantized_hidden_states = hidden_states
@@ -241,6 +293,13 @@ def quant_apply_mlp(
     is_mc2 = _EXTRA_CTX.moe_comm_type == MoECommType.MC2
     if w1_scale_bias is None and w1_offset is None and is_mc2:
         if _custom_gmm_swiglu_enabled(fusion, dynamic_eplb) and not use_mxfp_quant:
+            logger.warning_once(
+                "MXFP8 MoE branch selected: branch=custom_gmm_swiglu, use_mxfp_quant=%s, rotation_enable=%s, hidden_shape=%s, hidden_dtype=%s",
+                use_mxfp_quant,
+                rotation_config.enable,
+                tuple(hidden_states.shape),
+                hidden_states.dtype,
+            )
             # gmm1: gate_up_proj & act_fn: swiglu
             hidden_states, swiglu_out_scale, _ = torch.ops._C_ascend.grouped_matmul_swiglu_quant_weight_nz_tensor_list(
                 x=hidden_states,
@@ -251,6 +310,13 @@ def quant_apply_mlp(
                 swiglu_limit=swiglu_limit,
             )
         elif use_gmm_swiglu_quant_fusion:
+            logger.warning_once(
+                "MXFP8 MoE branch selected: branch=fused_swiglu_quant, use_mxfp_quant=%s, rotation_enable=%s, hidden_shape=%s, hidden_dtype=%s",
+                use_mxfp_quant,
+                rotation_config.enable,
+                tuple(hidden_states.shape),
+                hidden_states.dtype,
+            )
             # gmm1: gate_up_proj & act_fn: swiglu
             hidden_states, swiglu_out_scale, _ = DeviceOperator.npu_grouped_matmul_swiglu_quant(
                 x=hidden_states,
@@ -268,6 +334,12 @@ def quant_apply_mlp(
             if quantized_hidden_states is not None:
                 dispose_tensor(quantized_hidden_states)
         elif rotate_mxfp8_swiglu:
+            logger.warning_once(
+                "MXFP8 MoE branch selected: branch=rotated_swiglu, rotation_enable=%s, hidden_shape=%s, hidden_dtype=%s",
+                rotation_config.enable,
+                tuple(hidden_states.shape),
+                hidden_states.dtype,
+            )
             hidden_states, swiglu_out_scale = _apply_rotated_mxfp8_swiglu_quant(
                 hidden_states=hidden_states,
                 w1=_require_single_tensor_for_swiglu_quant(w1, name="w1"),
@@ -416,6 +488,12 @@ def quant_apply_mlp(
             if quantized_hidden_states is not None:
                 dispose_tensor(quantized_hidden_states)
         elif rotate_mxfp8_swiglu:
+            logger.warning_once(
+                "MXFP8 MoE branch selected: branch=rotated_swiglu, rotation_enable=%s, hidden_shape=%s, hidden_dtype=%s",
+                rotation_config.enable,
+                tuple(hidden_states.shape),
+                hidden_states.dtype,
+            )
             hidden_states, swiglu_out_scale = _apply_rotated_mxfp8_swiglu_quant(
                 hidden_states=hidden_states,
                 w1=_require_single_tensor_for_swiglu_quant(w1, name="w1"),
@@ -436,6 +514,12 @@ def quant_apply_mlp(
             if quantized_hidden_states is not None:
                 dispose_tensor(quantized_hidden_states)
         else:
+            logger.warning_once(
+                "MXFP8 MoE branch selected: branch=fallback_grouped_matmul, rotation_enable=%s, hidden_shape=%s, hidden_dtype=%s",
+                rotation_config.enable,
+                tuple(hidden_states.shape),
+                hidden_states.dtype,
+            )
             w1_scale[0] = w1_scale[0].to(w2_scale[0].dtype)
             # gmm1: gate_up_proj
             hidden_states = torch_npu.npu_grouped_matmul(
@@ -611,6 +695,7 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
     fusion = mlp_compute_input.fusion
     swiglu_limit = mlp_compute_input.swiglu_limit
 
+    logger.warning_once("mlp_compute_input.quant.is_quant: %s", mlp_compute_input.quant.is_quant)
     if not mlp_compute_input.quant.is_quant:
         return unquant_apply_mlp(
             hidden_states=hidden_states,
