@@ -196,10 +196,10 @@ def quant_apply_mlp(
     activation: str | None = None,
     swiglu_limit: float = 0.0,
     use_w4a8_per_channel_gmm_swiglu: bool = False,
+    rotation_config: MXFP8RotationConfig | None = None,
 ) -> torch.Tensor:
     input_hidden_dtype = hidden_states.dtype
     use_gmm_swiglu_quant_fusion = use_mxfp_quant or (fusion and not dynamic_eplb)
-    rotation_config = MXFP8RotationConfig()
     rotate_mxfp8_swiglu = False
 
     if use_mxfp_quant:
@@ -210,7 +210,10 @@ def quant_apply_mlp(
         if w1_offset is not None or w2_offset is not None:
             raise NotImplementedError("MXFP path does not support antiquant offset yet.")
         if act_quant_type == torch.float8_e4m3fn:
-            rotation_config = _get_mxfp8_rotation_config()
+            if mxfp_quant_dtype == QuantType.MXFP8 and rotation_config is None:
+                raise RuntimeError("Missing MXFP8 rotation_config for MoE MLP runtime")
+            if rotation_config is None:
+                rotation_config = MXFP8RotationConfig()
             if rotation_config.enable:
                 validate_mxfp8_rotation_config(rotation_config)
                 rotate_mxfp8_swiglu = True
@@ -761,4 +764,5 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
         activation=activation,
         swiglu_limit=swiglu_limit,
         use_w4a8_per_channel_gmm_swiglu=mlp_compute_input.quant.use_w4a8_per_channel_gmm_swiglu,
+        rotation_config=mlp_compute_input.quant.rotation,
     )

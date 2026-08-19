@@ -292,6 +292,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 w1_scale_bias=w1_scale_bias,
                 w2_scale_bias=w2_scale_bias,
                 swiglu_limit=layer.swiglu_limit,
+                mxfp8_rotation=getattr(self, "rotation_config", None),
                 # Per-layer MoE LoRA state, set once by AscendFusedMoEWithLoRA
                 # when an adapter wraps this layer; None for non-LoRA layers.
                 lora_context=getattr(layer, "_ascend_moe_lora_context", None),
@@ -374,6 +375,7 @@ else:
                 )
 
             self.quant_type = self._get_quant_type()
+            self.rotation_config = getattr(self._quant_method, "rotation_config", None)
             # Can be removed after vllm fixes the issue.
             if self._needs_routed_expert_parameter_aliases():
                 self._register_routed_expert_parameter_aliases()
@@ -654,12 +656,14 @@ else:
 
                     set_flash_common3_context(topk_weights=topk_weights, topk_ids=topk_ids)
 
+            rotation_config = getattr(self._quant_method, "rotation_config", None)
             prepare_output = _EXTRA_CTX.moe_comm_method.prepare(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
                 replace_allreduce=_EXTRA_CTX.flash_comm_v1_enabled,
                 enable_shared_expert_dp=self.enable_shared_expert_dp,
                 quant_type=self.quant_type,
+                rotation_config=rotation_config,
             )
             hidden_states = prepare_output.hidden_states
             router_logits = prepare_output.router_logits
@@ -821,11 +825,9 @@ else:
                     shared_out = self._shared_experts.down_proj((quantized_x, swiglu_out_scale))[0]
                 elif has_quantized_shared and self.quant_type == QuantType.MXFP8:
                     original_dtype = hidden_states.dtype
-                    rotation_config = _get_shared_expert_mxfp8_rotation_config()
+                    rotation_config = getattr(self, "rotation_config", None) or _get_shared_expert_mxfp8_rotation_config()
                     if rotation_config.enable:
-                        quant_config = getattr(get_current_vllm_config(), "quant_config", None)
-                        quant_description = getattr(quant_config, "quant_description", {}) or {}
-                        validate_mxfp8_rotation_config(rotation_config, quant_description.get("group_size", 32))
+                        validate_mxfp8_rotation_config(rotation_config, getattr(self._quant_method, "group_size", 32))
                     torch.npu.current_stream().wait_event(fused_moe_evts.before_routed_experts)
                     if rotation_config.enable:
                         hidden_states = apply_mxfp8_block_rotation(hidden_states, rotation_config)

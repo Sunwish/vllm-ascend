@@ -252,7 +252,17 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
         ensure_mxfp8_moe_available("W8A8_MXFP8 MoE quantization")
 
         vllm_config = get_current_vllm_config()
-        self.group_size = vllm_config.quant_config.quant_description.get("group_size", 32)
+        quant_description = vllm_config.quant_config.quant_description
+        self.group_size = quant_description.get("group_size", 32)
+        self.rotation_config = get_mxfp8_rotation_config(quant_description)
+        validate_mxfp8_rotation_config(self.rotation_config, group_size=self.group_size)
+        if self.rotation_config.enable:
+            logger.info_once(
+                "MXFP8 block rotation enabled for dynamic MoE: kind=%s, block_size=%s, seed=%s",
+                self.rotation_config.kind,
+                self.rotation_config.block_size,
+                self.rotation_config.seed,
+            )
         ascend_config = get_ascend_config()
         self.use_aclgraph = (
             vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
@@ -380,6 +390,7 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
                 mxfp_scale_dtype=FLOAT8_E8M0FNU_DTYPE,
                 mxfp_per_token_scale_dtype=FLOAT8_E8M0FNU_DTYPE,
                 mxfp_use_bf16=(x.dtype in [torch.bfloat16, torch.float8_e4m3fn]),
+                mxfp8_rotation=self.rotation_config,
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
                 swiglu_limit=layer.swiglu_limit,

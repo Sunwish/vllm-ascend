@@ -179,6 +179,7 @@ class AscendFusedMoE(FusedMoE):
             self.quant_method = self.quant_config.get_quant_method(self, self.layer_name, tid2eid=self.tid2eid)
 
         assert self.quant_method is not None
+        self.rotation_config = getattr(self.quant_method, "rotation_config", None)
         # Keep base_quant_method in sync with the swapped-in Ascend method,
         # otherwise FusedMoE.maybe_init_modular_kernel (called via the V2
         # model runner's prepare_communication_buffer_for_model) would dispatch
@@ -485,6 +486,7 @@ class AscendFusedMoE(FusedMoE):
             replace_allreduce=_EXTRA_CTX.flash_comm_v1_enabled,
             enable_shared_expert_dp=self.enable_shared_expert_dp,
             quant_type=self.quant_type,
+            rotation_config=getattr(self, "rotation_config", None),
         )
         hidden_states = prepare_output.hidden_states
         router_logits = prepare_output.router_logits
@@ -647,11 +649,9 @@ class AscendFusedMoE(FusedMoE):
                 shared_out = self._shared_experts.down_proj((quantized_x, swiglu_out_scale))[0]
             elif has_quantized_shared and self.quant_type == QuantType.MXFP8:
                 original_dtype = hidden_states.dtype
-                rotation_config = _get_shared_expert_mxfp8_rotation_config()
+                rotation_config = getattr(self, "rotation_config", None) or _get_shared_expert_mxfp8_rotation_config()
                 if rotation_config.enable:
-                    quant_config = getattr(get_current_vllm_config(), "quant_config", None)
-                    quant_description = getattr(quant_config, "quant_description", {}) or {}
-                    validate_mxfp8_rotation_config(rotation_config, quant_description.get("group_size", 32))
+                    validate_mxfp8_rotation_config(rotation_config, getattr(self.quant_method, "group_size", 32))
                 torch.npu.current_stream().wait_event(fused_moe_evts.before_routed_experts)
                 if rotation_config.enable:
                     hidden_states = apply_mxfp8_block_rotation(hidden_states, rotation_config)

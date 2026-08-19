@@ -20,7 +20,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch_npu
-from vllm.config import get_current_vllm_config
 from vllm.logger import logger
 from vllm.distributed.parallel_state import (
     get_dp_group,
@@ -38,32 +37,27 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEPrepareOutput
 from vllm_ascend.quantization.mxfp8_rotation import (
     MXFP8RotationConfig,
     apply_mxfp8_block_rotation,
-    get_mxfp8_rotation_config,
     validate_mxfp8_rotation_config,
 )
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import enable_sp, enable_sp_by_pass, npu_stream_switch
 
 
-def _get_runtime_mxfp8_rotation_config() -> tuple[MXFP8RotationConfig, dict]:
-    try:
-        vllm_config = get_current_vllm_config()
-        quant_config = getattr(vllm_config, "quant_config", None)
-        quant_description = getattr(quant_config, "quant_description", {}) or {}
-    except Exception:
-        return MXFP8RotationConfig(), {}
-    return get_mxfp8_rotation_config(quant_description), quant_description
-
-
-def _maybe_apply_mxfp8_prepare_rotation(hidden_states: torch.Tensor, quant_type: QuantType) -> torch.Tensor:
+def _maybe_apply_mxfp8_prepare_rotation(
+    hidden_states: torch.Tensor,
+    quant_type: QuantType,
+    rotation_config: MXFP8RotationConfig | None,
+    *,
+    group_size: int = 32,
+) -> torch.Tensor:
     if quant_type != QuantType.MXFP8:
         return hidden_states
-
-    rotation_config, quant_description = _get_runtime_mxfp8_rotation_config()
+    if rotation_config is None:
+        raise RuntimeError("Missing MXFP8 rotation_config for MoE prepare runtime")
     if not rotation_config.enable:
         return hidden_states
 
-    validate_mxfp8_rotation_config(rotation_config, group_size=quant_description.get("group_size", 32))
+    validate_mxfp8_rotation_config(rotation_config, group_size=group_size)
     logger.warning_once(
         "MXFP8 block rotation enabled for MoE prepare: kind=%s, block_size=%s, seed=%s, hidden_shape=%s, "
         "dtype=%s, contiguous=%s, stride=%s, quant_type=%s",
@@ -108,6 +102,7 @@ class PrepareAndFinalize(ABC):
         enable_shared_expert_dp: bool = False,
         replace_allreduce: bool = False,
         quant_type: QuantType = QuantType.NONE,
+        rotation_config: MXFP8RotationConfig | None = None,
     ) -> MoEPrepareOutput:
         """
         Prepare tensors before MoE computation. May involve:
@@ -178,6 +173,7 @@ class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
         enable_shared_expert_dp: bool = False,
         replace_allreduce: bool = False,
         quant_type=QuantType.NONE,
+        rotation_config: MXFP8RotationConfig | None = None,
     ) -> MoEPrepareOutput:
         """
         Preparation steps:
@@ -190,7 +186,7 @@ class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
         Returns:
             MoEPrepareOutput where `mc2_mask` is None for All2All path.
         """
-        hidden_states = _maybe_apply_mxfp8_prepare_rotation(hidden_states, quant_type)
+        hidden_states = _maybe_apply_mxfp8_prepare_rotation(hidden_states, quant_type, rotation_config)
         self.replace_allreduce = replace_allreduce
         self.enable_shared_expert_dp = enable_shared_expert_dp
 
@@ -296,6 +292,7 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
         enable_shared_expert_dp: bool = False,
         replace_allreduce: bool = False,
         quant_type=QuantType.NONE,
+        rotation_config: MXFP8RotationConfig | None = None,
     ) -> MoEPrepareOutput:
         """
         Preparation steps:
@@ -309,7 +306,7 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
         Returns:
             MoEPrepareOutput, possibly sliced/padded.
         """
-        hidden_states = _maybe_apply_mxfp8_prepare_rotation(hidden_states, quant_type)
+        hidden_states = _maybe_apply_mxfp8_prepare_rotation(hidden_states, quant_type, rotation_config)
         self.replace_allreduce = replace_allreduce
         self.enable_shared_expert_dp = enable_shared_expert_dp
         mc2_mask = _EXTRA_CTX.mc2_mask
@@ -391,6 +388,7 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         enable_shared_expert_dp: bool = False,
         replace_allreduce: bool = False,
         quant_type=QuantType.NONE,
+        rotation_config: MXFP8RotationConfig | None = None,
     ) -> MoEPrepareOutput:
         """
         Preparation steps:
@@ -400,14 +398,25 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             MoEPrepareOutput with global tensors.
         """
         if enable_sp() or enable_sp_by_pass():
-            return self._prepare_with_ep_group(hidden_states, router_logits, quant_type)
+            return self._prepare_with_ep_group(hidden_states, router_logits, quant_type, rotation_config)
 
-        return self._prepare_with_dp_group(hidden_states, router_logits, enable_shared_expert_dp, replace_allreduce)
+        return self._prepare_with_dp_group(
+            hidden_states,
+            router_logits,
+            enable_shared_expert_dp,
+            replace_allreduce,
+            quant_type,
+            rotation_config,
+        )
 
     def _prepare_with_ep_group(
-        self, hidden_states: torch.Tensor, router_logits: torch.Tensor, quant_type=QuantType.NONE
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        quant_type=QuantType.NONE,
+        rotation_config: MXFP8RotationConfig | None = None,
     ) -> MoEPrepareOutput:
-        hidden_states = _maybe_apply_mxfp8_prepare_rotation(hidden_states, quant_type)
+        hidden_states = _maybe_apply_mxfp8_prepare_rotation(hidden_states, quant_type, rotation_config)
         pertoken_scale = None
         if quant_type == QuantType.W8A8:
             hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
@@ -479,6 +488,7 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         enable_shared_expert_dp: bool = False,
         replace_allreduce: bool = False,
         quant_type=QuantType.NONE,
+        rotation_config: MXFP8RotationConfig | None = None,
     ) -> MoEPrepareOutput:
         """
         Preparation steps:
@@ -489,7 +499,7 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         Returns:
             MoEPrepareOutput with global tensors.
         """
-        hidden_states = _maybe_apply_mxfp8_prepare_rotation(hidden_states, quant_type)
+        hidden_states = _maybe_apply_mxfp8_prepare_rotation(hidden_states, quant_type, rotation_config)
         self.enable_shared_expert_dp = enable_shared_expert_dp
         if self.moe_config.dp_size > 1:
             max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp

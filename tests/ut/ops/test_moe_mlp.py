@@ -141,6 +141,7 @@ class TestUnifiedApplyMlpRequest(unittest.TestCase):
             with self.subTest(quant_type=quant_type):
                 hidden_states = torch.randn(2, 8)
                 expected = torch.randn(2, 8)
+                rotation = MXFP8RotationConfig(enable=True, block_size=32, seed=5)
                 mlp_compute_input = MoEMlpComputeInput(
                     hidden_states=hidden_states,
                     group_list=torch.tensor([2, 2], dtype=torch.int64),
@@ -160,6 +161,7 @@ class TestUnifiedApplyMlpRequest(unittest.TestCase):
                             weight_quant_type=mxfp_dtype,
                             use_bf16=False,
                         ),
+                        rotation=rotation,
                     ),
                     fusion=True,
                     activation="silu",
@@ -182,6 +184,7 @@ class TestUnifiedApplyMlpRequest(unittest.TestCase):
                 self.assertEqual(quant_kwargs["act_quant_type"], mxfp_dtype)
                 self.assertEqual(quant_kwargs["weight_quant_type"], mxfp_dtype)
                 self.assertFalse(quant_kwargs["use_bf16"])
+                self.assertEqual(quant_kwargs["rotation_config"], rotation)
                 mock_unquant.assert_not_called()
 
     def test_request_quant_path_passes_w4a8_per_channel_flag(self):
@@ -286,6 +289,7 @@ class TestUnifiedApplyMlpRequest(unittest.TestCase):
             scale_type=None,
             per_token_scale_type=None,
             use_bf16=True,
+            activation="silu",
             swiglu_limit=0,
             rotation_config=rotation_config,
         )

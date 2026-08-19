@@ -211,3 +211,5 @@ class TestAscendW8A8MXFP8MoEMethod(TestBase):
         )
         mock_select.assert_called_once()
         mock_comm.fused_experts.assert_called_once()
+        fused_input = mock_comm.fused_experts.call_args.kwargs["fused_experts_input"]
+        self.assertEqual(fused_input.quant.rotation, self.scheme.rotation_config)

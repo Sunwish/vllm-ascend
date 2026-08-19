@@ -803,6 +803,7 @@ class TestAscendFusedMoE:
             replace_allreduce=True,
             enable_shared_expert_dp=False,
             quant_type=QuantType.NONE,
+            rotation_config=None,
         )
         apply_kwargs = layer.quant_method.apply.call_args.kwargs
         assert apply_kwargs["x"] is prepared_hidden
@@ -972,6 +973,8 @@ class TestAscendFusedMoESharedExperts:
 
         layer.multistream_overlap_shared_expert = False
         layer.quant_type = QuantType.MXFP8
+        layer.rotation_config = MXFP8RotationConfig(enable=True, block_size=32, seed=3)
+        layer.quant_method = SimpleNamespace(group_size=32)
         layer._shared_experts = MagicMock()
         layer._shared_experts.gate_up_proj.weight_scale = torch.ones(1)
         layer._shared_experts.down_proj.weight_scale = torch.ones(1)

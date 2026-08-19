@@ -60,6 +60,7 @@ from __future__ import annotations
 import torch
 
 import vllm_ascend.ops.fused_moe.moe_stage_params as _stage_params
+from vllm_ascend.quantization.mxfp8_rotation import MXFP8RotationConfig
 from vllm_ascend.ops.fused_moe.moe_stage_contracts import (
     MoEAllGatherCombineMetadata,
     MoEAllToAllCombineMetadata,
@@ -139,6 +140,7 @@ def build_fused_experts_input(
     mxfp_scale_dtype: torch.dtype | None = None,
     mxfp_per_token_scale_dtype: torch.dtype | None = None,
     mxfp_use_bf16: bool | None = None,
+    mxfp8_rotation: MXFP8RotationConfig | None = None,
     is_per_channel_weight: bool = False,
     w1_scale: list[torch.Tensor] | torch.Tensor | None = None,
     w2_scale: list[torch.Tensor] | torch.Tensor | None = None,
@@ -191,6 +193,7 @@ def build_fused_experts_input(
                 mxfp_per_token_scale_dtype=mxfp_per_token_scale_dtype,
                 mxfp_use_bf16=mxfp_use_bf16,
             ),
+            rotation=mxfp8_rotation,
             is_per_channel_weight=is_per_channel_weight,
         ),
         swiglu_limit=swiglu_limit,

@@ -43,6 +43,7 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
     TokenDispatcherWithAllGather,
     TokenDispatcherWithMC2,
 )
+from vllm_ascend.quantization.mxfp8_rotation import MXFP8RotationConfig
 from vllm_ascend.quantization.quant_type import QuantType
 
 _MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
@@ -101,6 +102,7 @@ class MoECommMethod(ABC):
         enable_shared_expert_dp: bool = False,
         replace_allreduce: bool = False,
         quant_type: QuantType = QuantType.NONE,
+        rotation_config: MXFP8RotationConfig | None = None,
     ) -> MoEPrepareOutput:
         return self.prepare_finalize.prepare(
             hidden_states,
@@ -108,6 +110,7 @@ class MoECommMethod(ABC):
             enable_shared_expert_dp,
             replace_allreduce,
             quant_type,
+            rotation_config,
         )
 
     def finalize(

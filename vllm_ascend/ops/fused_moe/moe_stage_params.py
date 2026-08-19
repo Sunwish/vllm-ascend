@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import torch
 import torch_npu
 
+from vllm_ascend.quantization.mxfp8_rotation import MXFP8RotationConfig
 from vllm_ascend.quantization.quant_type import QuantType
 
 
@@ -62,6 +63,7 @@ class MoEQuantParams:
     quant_type: QuantType = QuantType.NONE
     comm_quant_mode: int | None = None
     mxfp: MoEMxfpParams | None = None
+    rotation: MXFP8RotationConfig | None = None
     is_per_channel_weight: bool = False
 
     @property
