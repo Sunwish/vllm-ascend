@@ -32,6 +32,27 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 logger = logging.getLogger(__name__)
 
 
+def _gather_tp_routes(topk_ids: torch.Tensor, token_count: int, tp_size: int, comm_type: MoECommType) -> torch.Tensor:
+    """Reconstruct prepare()'s token layout using equal-sized HCCL collectives.
+
+    ALLTOALL uses tensor_split (unequal shards for e.g. 65 tokens / TP=8).
+    MC2 pads first. Padding the collective inputs avoids unsupported uneven
+    all_gather sizes on HCCL; the ALLTOALL padding is removed per rank.
+    """
+    if comm_type == MoECommType.ALLTOALL:
+        padded_count = max(token_count, tp_size)
+        sizes = [padded_count // tp_size + (rank < padded_count % tp_size) for rank in range(tp_size)]
+    else:
+        sizes = [topk_ids.shape[0]] * tp_size
+    width = max(sizes)
+    if topk_ids.shape[0] > width:
+        raise RuntimeError(f"[R3][TP_CAPTURE] unexpected local rows={topk_ids.shape[0]} shard_sizes={sizes}")
+    local = torch.nn.functional.pad(topk_ids, (0, 0, 0, width - topk_ids.shape[0])).contiguous()
+    gathered = [torch.empty_like(local) for _ in range(tp_size)]
+    dist.all_gather(gathered, local, group=get_tp_group().device_group)
+    return torch.cat([part[:size] for part, size in zip(gathered, sizes)], dim=0)[:token_count]
+
+
 def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
     """Capture expert routing decisions for a specific layer.
 
@@ -71,6 +92,37 @@ def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
         start_loc = 0
         end_loc = topk_ids.shape[0]
         token_num_per_dp = topk_ids.shape[0]
+        comm_type = getattr(ctx, "moe_comm_type", None)
+        method = getattr(ctx, "moe_comm_method", None)
+        prepare = getattr(method, "prepare_finalize", None)
+        sharded = comm_type in (MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2)
+        if self.tp_size > 1 and sharded:
+            if prepare is None:
+                raise RuntimeError("[R3][TP_CAPTURE] missing prepare_finalize for TP-sharded capture")
+            split = not (prepare.replace_allreduce or prepare.enable_shared_expert_dp)
+            full_count = getattr(prepare, "num_tokens", None) if split else topk_ids.shape[0]
+            if not isinstance(full_count, int) or full_count <= 0:
+                raise RuntimeError("[R3][TP_CAPTURE] missing prepare_finalize.num_tokens for TP-sharded capture")
+            if split:
+                local_rows = topk_ids.shape[0]
+                topk_ids = _gather_tp_routes(topk_ids, full_count, self.tp_size, comm_type)
+                # Python runs at graph capture, not graph replay. Request-level
+                # validation in verl checks every returned routing tensor.
+                key = (comm_type.name, self.tp_size)
+                reported = self.__dict__.setdefault("_r3_capture_layouts", set())
+                if key not in reported:
+                    logger.warning(
+                        "[R3][TP_CAPTURE] dp=%s tp=%s comm=%s local_rows=%s reconstructed_rows=%s "
+                        "equal_size_all_gather=True; graph replay reuses this capture path",
+                        self.dp_rank,
+                        self.tp_size,
+                        comm_type.name,
+                        local_rows,
+                        full_count,
+                    )
+                    reported.add(key)
+            token_num_per_dp = full_count
+            end_loc = full_count
     else:  # multi dp
         num_tokens_dp = ctx.dp_metadata.num_tokens_across_dp_cpu
         token_num_per_dp = int(num_tokens_dp[self.dp_rank].item())
@@ -148,24 +200,7 @@ def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
             # but we fires all2all scenario first.
             # the result will be the same.
             # all2all scenario in vllm-ascend.
-            if _EXTRA_CTX.moe_comm_type == MoECommType.ALLTOALL:
-                gather_topk_ids_shape = (
-                    (token_num_per_dp, topk_ids.shape[1])
-                    if token_num_per_dp >= self.tp_size
-                    else (self.tp_size, topk_ids.shape[1])
-                )
-            # mc2 scenario in vllm-ascend
-            else:
-                gather_topk_ids_shape = (n * self.tp_size, topk_ids.shape[1])
-
-            gather_topk_ids = torch.empty(
-                gather_topk_ids_shape,
-                dtype=topk_ids.dtype,
-                device=topk_ids.device,
-            )
-            split_topk_ids = torch.tensor_split(gather_topk_ids, self.tp_size, dim=0)
-            dist.all_gather(list(split_topk_ids), topk_ids, get_tp_group().device_group)
-            topk_ids = gather_topk_ids
+            topk_ids = _gather_tp_routes(topk_ids, token_num_per_dp, self.tp_size, _EXTRA_CTX.moe_comm_type)
             start_loc = 0
             end_loc = token_num_per_dp
         else:
@@ -177,10 +212,10 @@ def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
                 f"dp_rank={self.dp_rank}, tp_size={self.tp_size})"
             )
 
-    # Defensive: model may expose more layers than the capture buffer
-    # was sized for (unusual, but guards against miss-config).
-    if layer_id >= self.device_buffer.shape[1]:
-        return
+    if layer_id < 0 or layer_id >= self.device_buffer.shape[1]:
+        raise RuntimeError(f"[R3][TP_CAPTURE] layer_id={layer_id} outside buffer {tuple(self.device_buffer.shape)}")
+    if token_num_per_dp > self.device_buffer.shape[0] or end_loc - start_loc != token_num_per_dp:
+        raise RuntimeError(f"[R3][TP_CAPTURE] token_count={token_num_per_dp} exceeds capture buffer/layout")
 
     self.device_buffer[:token_num_per_dp, layer_id, :] = topk_ids[start_loc:end_loc, :]
 

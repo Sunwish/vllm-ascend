@@ -138,7 +138,7 @@ class TestRoutedExpertsCapturerCapture:
         try:
             topk_ids = torch.arange(5 * 2).view(5, 2).to(torch.int32)
 
-            def mock_all_gather_impl(output_list, input_tensor, device_group):
+            def mock_all_gather_impl(output_list, input_tensor, group):
                 output_list[0].copy_(input_tensor)
                 output_list[1].copy_(input_tensor + 5 * 2)
 
@@ -184,7 +184,7 @@ class TestRoutedExpertsCapturerCapture:
         try:
             topk_ids = torch.arange(4 * 2).view(4, 2).to(torch.int32)
 
-            def mock_all_gather_impl(output_list, input_tensor, device_group):
+            def mock_all_gather_impl(output_list, input_tensor, group):
                 output_list[0].copy_(input_tensor)
                 output_list[1].copy_(input_tensor + 4 * 2)
 
@@ -215,7 +215,7 @@ class TestRoutedExpertsCapturerCapture:
 
     @patch("vllm_ascend.patch.worker.patch_routed_experts_capture.get_forward_context")
     def test_layer_id_out_of_bounds(self, mock_get_ctx):
-        """Test that out-of-bounds layer_id is handled gracefully."""
+        """A missing layer must fail instead of returning incomplete routing."""
         capturer = self._create_mock_capturer(dp_rank=0, tp_size=1)
         ctx = self._create_mock_forward_context(dp_metadata=None)
         mock_get_ctx.return_value = ctx
@@ -223,7 +223,8 @@ class TestRoutedExpertsCapturerCapture:
         topk_ids = torch.tensor([[0, 1]], dtype=torch.int32)
         capturer.device_buffer = torch.zeros((100, 5, 2))
 
-        capture(capturer, layer_id=10, topk_ids=topk_ids)
+        with pytest.raises(RuntimeError, match="layer_id=10"):
+            capture(capturer, layer_id=10, topk_ids=topk_ids)
 
         assert torch.all(capturer.device_buffer == 0)
 
